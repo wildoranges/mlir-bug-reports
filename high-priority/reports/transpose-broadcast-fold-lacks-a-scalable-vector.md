@@ -1,10 +1,12 @@
 # [fuzzer-found][mlir][vector] transpose(broadcast) fold lacks a scalable-vector guard (assertion failure in mlir-opt --canonicalize)
 
-`FoldTransposeBroadcast` is registered as a canonicalization of `vector::TransposeOp`, so the plain upstream canonicalizer runs it on every transpose. The pattern reads `inputShape = inputType.getShape()`, i.e. the *minimum* sizes of a scalable vector, and then treats every dimension whose minimum size is 1 as a fixed unit dimension; it never rejects scalable source or result types and relies on a debug-only `assert(vector::isBroadcastableTo(inputType, outputType) == BroadcastableToResult::Success)` as its only later protection. Since #239897 the new VectorToXeGPU pattern guards the same situation explicitly by returning `notifyMatchFailure("scalable vectors")` (https://github.com/llvm/llvm-project/blob/8445b527ed0da1f9156f27be8c193624d0292253/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp#L1572-L1573), but the Vector fold still does not.
+## LLVM version and environment
 
-https://github.com/llvm/llvm-project/blob/8445b527ed0da1f9156f27be8c193624d0292253/mlir/lib/Dialect/Vector/IR/VectorOps.cpp#L7758-L7826
+- Commit: `0cae57720c3ca7cb09b5ba48d199f1ba04e3aae2` (2026-11-26)
+- Build: `Release` with `LLVM_ENABLE_ASSERTIONS=ON`
+- Platform: `x86_64` Linux
 
-On the reproducer, `vector<[1]xf32>` broadcasts to `vector<4x[1]xf32>` and is then transposed to `vector<[1]x4xf32>`, which `TransposeOp::verify` accepts because it only compares minimum dimension sizes. The fold sees the minimum shape `[4, 1] -> [1, 4]`, treats the scalable dimension as an ordinary unit dimension, and concludes the permutation can be folded. `vector::isBroadcastableTo` also compares the scalable flags, so for this relocated scalable dimension it returns `DimensionMismatch` and the assertion at `VectorOps.cpp:7819` fires, aborting `mlir-opt` (`rc = 134`, SIGABRT) on valid input. In an assertions-disabled build the same path would proceed to `replaceOpWithNewOp<vector::BroadcastOp>` and synthesize a broadcast that moves the scalable dimension to a different position, which is not equivalent to the original transpose.
+## Reproducer
 
 `repro.mlir`:
 ```mlir
@@ -15,20 +17,68 @@ func.func @f(%v: vector<[1]xf32>) -> vector<[1]x4xf32> {
 }
 ```
 
+Commands:
+```console
+$ mlir-opt repro.mlir -o /dev/null && echo verifies
+$ mlir-opt repro.mlir --canonicalize
+```
+
+
+## Expected behaviour
+
+The input is valid IR. `--canonicalize` should leave the `vector.transpose` intact (the scalable dimension moves from dim 1 to dim 0, so `vector<[1]xf32>` is not directly broadcastable to `vector<[1]x4xf32>`).
+
+## Actual behaviour
+
+`mlir-opt --canonicalize` aborts with an assertion failure in `FoldTransposeBroadcast::matchAndRewrite` (exit code 134, SIGABRT):
+
 ```console
 $ mlir-opt repro.mlir -o /dev/null && echo verifies
 verifies
 $ mlir-opt repro.mlir --canonicalize
-mlir-opt: .../mlir/lib/Dialect/Vector/IR/VectorOps.cpp:7819: virtual LogicalResult (anonymous namespace)::FoldTransposeBroadcast::matchAndRewrite(vector::TransposeOp, PatternRewriter &) const: Assertion `vector::isBroadcastableTo(inputType, outputType) == vector::BroadcastableToResult::Success && "not broadcastable directly to transpose output"' failed.
+mlir-opt: .../mlir/lib/Dialect/Vector/IR/VectorOps.cpp:7925: virtual LogicalResult (anonymous namespace)::FoldTransposeBroadcast::matchAndRewrite(vector::TransposeOp, PatternRewriter &) const: Assertion `vector::isBroadcastableTo(inputType, outputType) == vector::BroadcastableToResult::Success && "not broadcastable directly to transpose output"' failed.
 ...
-#12 0x000059272eae0bb4 void llvm::function_ref<void ()>::callback_fn<mlir::PatternApplicator::matchAndRewrite(mlir::Operation*, mlir::PatternRewriter&, llvm::function_ref<bool (mlir::Pattern const&)>, llvm::function_ref<void (mlir::Pattern const&)>, llvm::function_ref<llvm::LogicalResult (mlir::Pattern const&)>)::$_0>(long) PatternApplicator.cpp:0:0
-#13 ... mlir::PatternApplicator::matchAndRewrite(mlir::Operation*, mlir::PatternRewriter&, llvm::function_ref<bool (mlir::Pattern const&)>, llvm::function_ref<void (mlir::Pattern const&)>, llvm::function_ref<llvm::LogicalResult (mlir::Pattern const&)>)
-#16 ... mlir::applyPatternsGreedily(mlir::Region&, mlir::FrozenRewritePatternSet const&, mlir::GreedyRewriteConfig, bool*)
-#18 ... mlir::detail::OpToOpPassAdaptor::run(mlir::Pass*, mlir::Operation*, mlir::AnalysisManager, bool, unsigned int)
+#12 ... PatternApplicator::matchAndRewrite(...)
+#14 ... (anonymous namespace)::GreedyPatternRewriteDriver::processWorklist()
+#16 ... mlir::applyPatternsGreedily(...)
+#17 ... (anonymous namespace)::Canonicalizer::runOnOperation()
+#18 ... mlir::detail::OpToOpPassAdaptor::run(...)
 ```
 
-**Version**: llvm-project main @ 8445b527ed0da1f9156f27be8c193624d0292253 (2026-11-16), Release + `LLVM_ENABLE_ASSERTIONS=ON`, x86_64 Linux.
+(In a build with assertions disabled, the pattern proceeds to emit an invalid `vector.broadcast %v : vector<[1]xf32> to vector<[1]x4xf32>`.)
 
-This testcase was generated by an automated MLIR testing tool that I am developing; some of its steps use AI.
+## Your commitment regarding this effort
 
-*Disclosure: I wrote this report with the help of Claude Code. I reproduced and reviewed everything in this report myself.*
+I am reporting this issue and do not currently plan to submit a fix PR. This is one of the high-priority bugs from my [MLIR fuzzing campaign](https://discourse.llvm.org/t/seeking-advice-on-reporting-100-mlir-bugs-found-by-an-automated-testing-tool/92920/8).
+
+## Related issues / fuzzing campaign
+
+- Fuzzing campaign summary: https://discourse.llvm.org/t/seeking-advice-on-reporting-100-mlir-bugs-found-by-an-automated-testing-tool/92920/8 (full list: https://github.com/wildoranges/mlir-bug-reports)
+- Deduplication check: Searched open and closed `llvm/llvm-project` issues and PRs for `FoldTransposeBroadcast` and `isBroadcastableTo` + `scalable` on 2026-11-26; no duplicate found.
+- Related PRs: #239897 (added an explicit scalable-vector guard in the similar VectorToXeGPU pattern), #215940 and #153056 (open generalization PRs touching `FoldTransposeBroadcast`).
+
+## AI Declaration
+
+This testcase was generated by an automated MLIR testing tool that I am developing; some of its steps use AI. I ran the reproducer on the reported commit, verified the expected vs. actual output, checked the referenced code lines, and reviewed all text myself.
+
+## Analysis and possible fix (optional)
+
+<details>
+<summary> Click to expand ... </summary>
+
+**Verified observations:**
+
+`FoldTransposeBroadcast` inspects `inputType.getShape()` (the minimum sizes of a scalable vector) and treats every dimension with size `1` as a fixed unit dimension, without checking scalability flags:
+
+https://github.com/llvm/llvm-project/blob/0cae57720c3ca7cb09b5ba48d199f1ba04e3aae2/mlir/lib/Dialect/Vector/IR/VectorOps.cpp#L7864-L7932
+
+On `vector<[1]xf32> -> vector<4x[1]xf32> -> vector<[1]x4xf32>`, the minimum shapes are `[1] -> [4, 1] -> [1, 4]`, so the pattern concludes the permutation can be folded directly into a broadcast. However, `vector::isBroadcastableTo` also checks scalable flags and returns `DimensionMismatch`, tripping the assertion.
+
+For comparison, the similar pattern in `VectorToXeGPU` explicitly rejects scalable vectors (#239897):
+https://github.com/llvm/llvm-project/blob/0cae57720c3ca7cb09b5ba48d199f1ba04e3aae2/mlir/lib/Conversion/VectorToXeGPU/VectorToXeGPU.cpp#L1572-L1573
+
+**Possible fix direction (hypothesis):**
+
+Either reject scalable vectors in `FoldTransposeBroadcast` or check that `vector::isBroadcastableTo(inputType, outputType) == BroadcastableToResult::Success` (including scalable dimension flags) as a match precondition rather than only an `assert`.
+
+</details>

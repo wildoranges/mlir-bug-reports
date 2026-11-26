@@ -1,32 +1,22 @@
 # [fuzzer-found][mlir] Min/max reduction neutral values assume the float format has inf/NaN (crash on f8/f4 in --convert-vector-to-llvm and linalg split_reduction)
 
-Two places that build float min/max reduction neutral values assume every float format has infinity and NaN, and abort on the small float formats (f8, f4) that lack them. The XeGPU reduction lowering already handles this (#233471): it uses infinity or NaN only when the format has them and falls back to a finite value otherwise.
+## LLVM version and environment
 
-**1. VectorToLLVM `createReductionNeutralValue`** (masked `vector.reduction` lowering). The helper takes the converted LLVM type and immediately does `cast<FloatType>(llvmType)`. `LLVMTypeConverter::convertFloatType` lowers f8E4M3FN, f4E2M1FN and similar formats to integers (`i8`, `i4`), so the cast aborts before any neutral value is chosen.
+- Commit: `0cae57720c3ca7cb09b5ba48d199f1ba04e3aae2` (2026-11-26)
+- Build: `Release` with `LLVM_ENABLE_ASSERTIONS=ON`
+- Platform: `x86_64` Linux
 
-https://github.com/llvm/llvm-project/blob/8445b527ed0da1f9156f27be8c193624d0292253/mlir/lib/Conversion/VectorToLLVM/ConvertVectorToLLVM.cpp#L625-L635
+## Reproducer
 
-`repro.mlir`:
+**Case 1: masked `vector.reduction` in `--convert-vector-to-llvm` / `--convert-to-llvm`**
+
+`repro1.mlir`:
 ```mlir
 func.func @f(%v: vector<4xf8E4M3FN>, %m: vector<4xi1>) -> f8E4M3FN {
   %0 = vector.mask %m { vector.reduction <maximumf>, %v : vector<4xf8E4M3FN> into f8E4M3FN } : vector<4xi1> -> f8E4M3FN
   return %0 : f8E4M3FN
 }
 ```
-
-```console
-$ mlir-opt repro.mlir -o /dev/null && echo verifies
-verifies
-$ mlir-opt repro.mlir --convert-vector-to-llvm
-mlir-opt: .../llvm/include/llvm/Support/Casting.h:566: decltype(auto) llvm::cast(From &) [To = mlir::FloatType, From = mlir::Type]: Assertion `isa<To>(Val) && "cast<Ty>() argument of incompatible type!"' failed.
-...
-#11 0x0000627bb497a86b (anonymous namespace)::MaskedReductionOpConversion::matchAndRewriteMaskableOp(mlir::vector::MaskOp, mlir::vector::MaskableOpInterface, mlir::ConversionPatternRewriter&) const ConvertVectorToLLVM.cpp:0:0
-#12 0x0000627bb4979166 (anonymous namespace)::VectorMaskOpConversionBase<mlir::vector::ReductionOp>::matchAndRewrite(mlir::vector::MaskOp, mlir::vector::MaskOpAdaptor, mlir::ConversionPatternRewriter&) const ConvertVectorToLLVM.cpp:0:0
-#13 ... llvm::LogicalResult mlir::ConversionPattern::dispatchTo1To1<mlir::ConvertOpToLLVMPattern<mlir::vector::MaskOp, false>, mlir::vector::MaskOp>(mlir::ConvertOpToLLVMPattern<mlir::vector::MaskOp, false> const&, mlir::vector::MaskOp, mlir::vector::MaskOp::GenericAdaptor<llvm::ArrayRef<mlir::ValueRange> >, mlir::ConversionPatternRewriter&)
-#14 ... mlir::ConvertOpToLLVMPattern<mlir::vector::MaskOp, false>::matchAndRewrite(mlir::Operation*, llvm::ArrayRef<mlir::ValueRange>, mlir::ConversionPatternRewriter&) const
-```
-
-The same assertion fires for the NaN-ignoring kinds, e.g. `maxnumf` over `f4E2M1FN`:
 
 `repro2.mlir`:
 ```mlir
@@ -36,17 +26,7 @@ func.func @f(%v: vector<4xf4E2M1FN>, %m: vector<4xi1>) -> f4E2M1FN {
 }
 ```
 
-```console
-$ mlir-opt repro2.mlir --convert-to-llvm
-mlir-opt: .../llvm/include/llvm/Support/Casting.h:566: decltype(auto) llvm::cast(From &) [To = mlir::FloatType, From = mlir::Type]: Assertion `isa<To>(Val) && "cast<Ty>() argument of incompatible type!"' failed.
-...
-```
-
-The same path lowers `vector<4xf32>` successfully.
-
-**2. `arith::getIdentityValueAttr`** (used by `arith::getNeutralElement`). For `maxnumf`/`minnumf` it calls `APFloat::getNaN` unless `useOnlyFiniteValue` is set, and for `maximumf`/`minimumf` it calls `APFloat::getInf`. `linalg::splitReduction` asks for the neutral element without `useOnlyFiniteValue`, so a `maxnumf` reduction over the finite-only `f4E2M1FN` reaches `APFloat::getNaN` and hits an `UNREACHABLE`. The same input with `f32` passes.
-
-https://github.com/llvm/llvm-project/blob/8445b527ed0da1f9156f27be8c193624d0292253/mlir/lib/Dialect/Arith/IR/ArithOps.cpp#L3507-L3576
+**Case 2: `linalg::splitReduction` via `arith::getIdentityValueAttr` on finite-only floats**
 
 `repro3.mlir`:
 ```mlir
@@ -72,17 +52,82 @@ module attributes {transform.with_named_sequence} {
 }
 ```
 
+Commands:
 ```console
+$ mlir-opt repro1.mlir -o /dev/null && echo verifies
+$ mlir-opt repro1.mlir --convert-vector-to-llvm
+$ mlir-opt repro2.mlir --convert-to-llvm
+$ mlir-opt repro3.mlir -o /dev/null && echo verifies
+$ mlir-opt repro3.mlir --transform-interpreter
+```
+
+
+## Expected behaviour
+
+All three inputs verify and pass cleanly when `f32` is used instead of `f8E4M3FN`/`f4E2M1FN`. For narrow float formats that lack infinity or NaN (or lower to integer types in LLVM), these passes should either build a valid representable neutral value (falling back to finite extrema when inf/NaN do not exist, as XeGPU does since #233471) or fail cleanly without aborting.
+
+## Actual behaviour
+
+`repro1.mlir` and `repro2.mlir` hit a `cast<FloatType>` assertion failure in `MaskedReductionOpConversion` / `createReductionNeutralValue`, and `repro3.mlir` hits an `UNREACHABLE` in `APFloat::getNaN`:
+
+```console
+$ mlir-opt repro1.mlir -o /dev/null && echo verifies
+verifies
+$ mlir-opt repro1.mlir --convert-vector-to-llvm
+mlir-opt: .../llvm/include/llvm/Support/Casting.h:566: decltype(auto) llvm::cast(From &) [To = mlir::FloatType, From = mlir::Type]: Assertion `isa<To>(Val) && "cast<Ty>() argument of incompatible type!"' failed.
+...
+#11 ... (anonymous namespace)::MaskedReductionOpConversion::matchAndRewriteMaskableOp(mlir::vector::MaskOp, mlir::vector::MaskableOpInterface, mlir::ConversionPatternRewriter&) const ConvertVectorToLLVM.cpp:0:0
+#12 ... (anonymous namespace)::VectorMaskOpConversionBase<mlir::vector::ReductionOp>::matchAndRewrite(...) ConvertVectorToLLVM.cpp:0:0
+#24 ... (anonymous namespace)::ConvertVectorToLLVMPass::runOnOperation() ConvertVectorToLLVMPass.cpp:0:0
+$ mlir-opt repro2.mlir --convert-to-llvm
+mlir-opt: .../llvm/include/llvm/Support/Casting.h:566: decltype(auto) llvm::cast(From &) [To = mlir::FloatType, From = mlir::Type]: Assertion `isa<To>(Val) && "cast<Ty>() argument of incompatible type!"' failed.
+...
+#11 ... (anonymous namespace)::MaskedReductionOpConversion::matchAndRewriteMaskableOp(...) ConvertVectorToLLVM.cpp:0:0
+#25 ... (anonymous namespace)::ConvertToLLVMPass::runOnOperation() ConvertToLLVMPass.cpp:0:0
 $ mlir-opt repro3.mlir -o /dev/null && echo verifies
 verifies
 $ mlir-opt repro3.mlir --transform-interpreter
 This floating point format does not support NaN
-UNREACHABLE executed at .../llvm/lib/Support/APFloat.cpp:965!
+UNREACHABLE executed at .../llvm/lib/Support/APFloat.cpp:1240!
 ...
+#10 ... llvm::detail::IEEEFloat::makeNaN(bool, bool, llvm::APInt const*)
+#11 ... mlir::arith::getIdentityValueAttr(mlir::arith::AtomicRMWKind, mlir::Type, mlir::OpBuilder&, mlir::Location, bool)
+#12 ... mlir::arith::getNeutralElement(mlir::Operation*)
+#13 ... mlir::linalg::splitReduction(...)
+#14 ... mlir::transform::SplitReductionOp::applyToOne(...)
 ```
 
-**Version**: llvm-project main @ 8445b527ed0da1f9156f27be8c193624d0292253 (2026-11-16), Release + `LLVM_ENABLE_ASSERTIONS=ON`, x86_64 Linux.
+## Your commitment regarding this effort
 
-This testcase was generated by an automated MLIR testing tool that I am developing; some of its steps use AI.
+I am reporting this issue and do not currently plan to submit a fix PR. This is one of the high-priority bugs from my [MLIR fuzzing campaign](https://discourse.llvm.org/t/seeking-advice-on-reporting-100-mlir-bugs-found-by-an-automated-testing-tool/92920/8).
 
-*Disclosure: I wrote this report with the help of Claude Code. I reproduced and reviewed everything in this report myself.*
+## Related issues / fuzzing campaign
+
+- Fuzzing campaign summary: https://discourse.llvm.org/t/seeking-advice-on-reporting-100-mlir-bugs-found-by-an-automated-testing-tool/92920/8 (full list: https://github.com/wildoranges/mlir-bug-reports)
+- Deduplication check: Searched open and closed `llvm/llvm-project` issues and PRs for `createReductionNeutralValue`, `MaskedReductionOpConversion`, `getIdentityValueAttr`, and `f4E2M1FN`/`f8E4M3FN` reductions on 2026-11-26; no duplicate found.
+- Related PRs: #233471 (fixed the same inf/NaN neutral-value assumption in XeGPU reduction lowering), #222275 (masked `fmaximum`/`fminimum` neutral values).
+
+## AI Declaration
+
+This testcase was generated by an automated MLIR testing tool that I am developing; some of its steps use AI. I ran the reproducers on the reported commit, verified the expected vs. actual output, checked the referenced code lines, and reviewed all text myself.
+
+## Analysis and possible fix (optional)
+
+<details>
+<summary> Click to expand ... </summary>
+
+**Verified observations:**
+
+1. **VectorToLLVM `createReductionNeutralValue`:** takes the converted LLVM type and unconditionally does `cast<FloatType>(llvmType)`:
+   https://github.com/llvm/llvm-project/blob/0cae57720c3ca7cb09b5ba48d199f1ba04e3aae2/mlir/lib/Conversion/VectorToLLVM/ConvertVectorToLLVM.cpp#L624-L634
+   Because `LLVMTypeConverter::convertFloatType` lowers `f8E4M3FN`, `f4E2M1FN`, etc. to integer types (`i8`, `i4`), the cast aborts.
+2. **`arith::getIdentityValueAttr` (called by `arith::getNeutralElement` / `linalg::splitReduction`):** calls `APFloat::getNaN` for `maxnumf`/`minnumf` (unless `useOnlyFiniteValue` is set) and `APFloat::getInf` for `maximumf`/`minimumf`, without checking whether the float semantics support NaN or infinity:
+   https://github.com/llvm/llvm-project/blob/0cae57720c3ca7cb09b5ba48d199f1ba04e3aae2/mlir/lib/Dialect/Arith/IR/ArithOps.cpp#L3519-L3588
+   For finite-only formats like `f4E2M1FN`, `APFloat::getNaN` hits `llvm_unreachable`.
+
+**Possible fix direction (hypothesis):**
+
+- In `arith::getIdentityValueAttr`, check `fltSemantics` (`hasInfinity` / `hasNaN`, or fall back to finite largest/smallest when unavailable, matching #233471).
+- In `VectorToLLVM`'s `MaskedReductionOpConversion` / `createReductionNeutralValue`, bail out cleanly or handle converted integer types when lowering narrow float reductions.
+
+</details>
